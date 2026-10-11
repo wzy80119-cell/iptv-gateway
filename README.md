@@ -112,6 +112,14 @@ cd /tmp/iptv-gateway-v*-linux-armv7 && bash install.sh
   sysctl -w net.ipv4.conf.all.rp_filter=0
   sysctl -w net.ipv4.conf.<IPTV网卡>.rp_filter=0
   ```
+- OpenWrt / iStoreOS / ImmortalWrt / HWRT 一类路由器还要**放开防火墙**：系统默认把 IPTV 口归到
+  `input REJECT` 的 `wan` zone，于是信令发得出去、流媒体进不来——表现为「新建流 → 6 秒
+  （组播 1.5 秒）内无数据」、所有频道 502。给 IPTV 口单独建一个 `input ACCEPT` 的 zone 即可
+  （实测：只改防火墙、不动二进制，立刻出流，3 路 RTSP 与 1 路组播各 15 秒 15–16.6MB）。
+  ```bash
+  grep -A6 "config zone" /etc/config/firewall   # 看 IPTV 口落在哪个 zone
+  iptables -S | grep -E 'zone_.*_input'          # 该 zone 的 input 是不是 REJECT
+  ```
 - 端口 `10010` 未被占用（旧 Docker 版在跑请先 `docker stop iptv-gateway`；
   旧 rtp2httpd 用 7000，可并存对比）
 
