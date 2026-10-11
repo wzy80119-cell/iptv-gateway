@@ -466,12 +466,16 @@ print_status() {
 }
 
 resolve_package() {
-    # 本地目录没有二进制（管道执行 / 只传了脚本）→ 再试同目录的归档包 → 最后在线下载
+    # 依次尝试：同目录已解压的二进制 → 同目录的归档包（就地解开）→ 在线下载。
+    # fetch_online 只把包解到 SRC 目录，二进制路径要再 find_local_bin 取一次。
     BIN_SRC="$(find_local_bin || true)"
     if [[ -z "$BIN_SRC" ]] && prepare_local_archive; then
         BIN_SRC="$(find_local_bin || true)"
     fi
-    [[ -n "$BIN_SRC" ]] || fetch_online
+    if [[ -z "$BIN_SRC" ]]; then
+        fetch_online
+        BIN_SRC="$(find_local_bin || true)"
+    fi
     [[ -n "$BIN_SRC" && -f "$BIN_SRC" ]] || die "缺少 iptv-gateway-linux-* 二进制（安装包不完整）"
 }
 
