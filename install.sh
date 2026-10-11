@@ -6,11 +6,12 @@
 #    A. 离线包安装（本脚本与 iptv-gateway-linux-amd64 在同一目录）：
 #         sudo bash install.sh
 #    B. 在线一键安装（从 GitHub Releases 自动下载，支持管道执行）：
-#         curl -fsSL <install.sh 的 raw 地址> | sudo bash
+#         curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/<仓库>/main/install.sh | sudo bash
 #       在线模式可用环境变量：
 #         --version x.y.z          安装指定版本（默认最新）
 #         GH_REPO=<owner>/<repo>   发布仓库（默认脚本内置值）
-#         GH_PROXY=<url>           GitHub 下载加速前缀，如 https://ghfast.top/
+#         GH_PROXY=<url>           GitHub 下载加速前缀，默认 https://gh-proxy.com/
+#                                  （设为空串 GH_PROXY= 则走 GitHub 直连）
 #         GH_TOKEN=<token>         私有仓库访问令牌
 #
 #  子命令：
@@ -28,6 +29,9 @@ set -uo pipefail
 # 在线安装的发布仓库
 GH_REPO="${GH_REPO:-wzy80119-cell/iptv-gateway}"
 ASSET_NAME="iptv-gateway-linux-native.zip"   # release 里不带版本号的资产名（latest 永链用）
+# 国内直连 github.com / raw.githubusercontent.com 基本被 DNS 污染，默认走加速前缀；
+# 用 ${VAR-} 而非 ${VAR:-}，好让 GH_PROXY= 能显式关掉前缀走直连。
+GH_PROXY="${GH_PROXY-https://gh-proxy.com/}"
 
 SRC="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BIN_SRC="$SRC/iptv-gateway-linux-amd64"
@@ -70,21 +74,39 @@ fetch_online() {
     command -v unzip >/dev/null || die "在线安装需要 unzip"
     [[ "$(uname -m)" == "x86_64" ]] || die "在线包仅提供 linux/amd64（当前架构 $(uname -m)）"
 
-    local base="${GH_PROXY}https://github.com/${GH_REPO}/releases"
-    local url
+    local sub
     if [[ -n "$VER_OPT" ]]; then
-        url="${base}/download/v${VER_OPT}/${ASSET_NAME}"
+        sub="download/v${VER_OPT}/${ASSET_NAME}"
     else
-        url="${base}/latest/download/${ASSET_NAME}"
+        sub="latest/download/${ASSET_NAME}"
+    fi
+    # 候选源：默认加速前缀 -> 备用加速前缀 -> GitHub 直连，逐个尝试
+    # （GH_PROXY= 显式为空表示只要直连，不再绕加速）
+    local -a prefixes=()
+    if [[ -n "$GH_PROXY" ]]; then
+        prefixes+=("$GH_PROXY")
+        local alt="https://ghfast.top/"
+        [[ "$GH_PROXY" == "$alt" ]] || prefixes+=("$alt")
+        prefixes+=("")
+    else
+        prefixes+=("")
     fi
 
     ONLINE_TMP="$(mktemp -d /tmp/iptv-install.XXXXXX)"
     local hdr=()
     [[ -n "${GH_TOKEN:-}" ]] && hdr=(-H "Authorization: Bearer ${GH_TOKEN}")
-    info "在线安装：下载 $url"
-    if ! curl -fL --retry 3 --connect-timeout 15 ${hdr[@]+"${hdr[@]}"} \
-            -o "$ONLINE_TMP/pkg.zip" "$url"; then
-        die "下载失败。可选：1) 加速前缀重试 curl ... | sudo GH_PROXY=https://ghfast.top/ bash；
+    local p url got=0
+    for p in "${prefixes[@]}"; do
+        url="${p}https://github.com/${GH_REPO}/releases/${sub}"
+        info "在线安装：下载 $url"
+        if curl -fL --retry 2 --connect-timeout 15 ${hdr[@]+"${hdr[@]}"} \
+                -o "$ONLINE_TMP/pkg.zip" "$url"; then
+            got=1; break
+        fi
+        warn "下载失败，换下一个源重试"
+    done
+    if [[ $got -ne 1 ]]; then
+        die "下载失败。可选：1) 换加速前缀 curl ... | sudo GH_PROXY=https://ghfast.top/ bash（GH_PROXY= 为直连）；
 2) 指定版本 --version x.y.z；3) 到 https://github.com/${GH_REPO}/releases 手动下载 zip 后离线安装"
     fi
     unzip -q "$ONLINE_TMP/pkg.zip" -d "$ONLINE_TMP/unpack"
