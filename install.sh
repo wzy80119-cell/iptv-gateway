@@ -55,6 +55,7 @@ PORT=10010
 HEALTH_URL="http://127.0.0.1:${PORT}/healthz"
 PREFIX=/app/iptv-gateway
 ONLINE_TMP=""
+LOCAL_TMP=""
 ARCH_TAG=""
 PKG_FMT=""
 ASSET_NAME=""
@@ -111,13 +112,44 @@ detect_env() {
     info "目标环境：架构 linux/$ARCH_TAG，init $INIT"
 }
 
-# 本地离线包里的二进制名（amd64 与 armv7 包只差后缀）
+# 本地离线包里的二进制名。归档文件本身也匹配 iptv-gateway-linux-* 这个通配
+# （Release 附件就叫 iptv-gateway-linux-armv7.tar.gz），必须排掉，
+# 否则会把 tar 包当二进制去 chmod + 执行，报「架构不匹配或文件损坏」。
 find_local_bin() {
     local f
     for f in "$SRC"/iptv-gateway-linux-*; do
-        [[ -f "$f" ]] && { echo "$f"; return 0; }
+        [[ -f "$f" ]] || continue
+        case "$f" in
+            *.tar.gz|*.tgz|*.zip|*.sha256|*.asc) continue ;;
+        esac
+        echo "$f"
+        return 0
     done
     return 1
+}
+
+# 脚本和本架构的归档包放在一起（没解压）：就地解开再用。
+# 注意本函数会改 SRC/CONF_SRC/M3U_SRC，所以只能在主流程里直接调用，
+# 不能写成 $(prepare_local_archive) —— 命令替换的子 shell 里改动传不出来，
+# 而且 info 走 stdout 会被当成返回值拼进 BIN_SRC。
+prepare_local_archive() {
+    local a="$SRC/$ASSET_NAME"
+    [[ -f "$a" ]] || return 1
+    LOCAL_TMP="$(mktemp -d /tmp/iptv-local.XXXXXX)"
+    info "使用本地离线包：$(basename "$a")"
+    if [[ "$PKG_FMT" == zip ]]; then
+        command -v unzip >/dev/null || { warn "解压 zip 需要 unzip"; return 1; }
+        unzip -q "$a" -d "$LOCAL_TMP" || { warn "解压失败：$a"; return 1; }
+    else
+        tar xzf "$a" -C "$LOCAL_TMP" || { warn "解压失败：$a"; return 1; }
+    fi
+    local dir
+    dir="$(find "$LOCAL_TMP" -maxdepth 1 -type d -name 'iptv-gateway-*' | head -1)"
+    [[ -n "$dir" ]] || { warn "包结构异常（未找到 iptv-gateway-* 顶层目录）"; return 1; }
+    SRC="$dir"
+    CONF_SRC="$SRC/config/iptv-gateway.conf"
+    M3U_SRC="$SRC/config/m3u"
+    return 0
 }
 
 # ---------- 在线模式：从 GitHub Releases 下载对应架构的发布包 ----------
@@ -178,6 +210,8 @@ fetch_online() {
 
 cleanup_online() {
     [[ -n "$ONLINE_TMP" && -d "$ONLINE_TMP" ]] && rm -rf "$ONLINE_TMP"
+    # 本地归档包解压出来的临时目录里含刚 chmod 过的二进制，退出时一并清掉
+    [[ -n "$LOCAL_TMP" && -d "$LOCAL_TMP" ]] && rm -rf "$LOCAL_TMP"
 }
 trap cleanup_online EXIT
 
@@ -342,7 +376,9 @@ install_conf() {
     done
     if [[ -n "$stale" ]]; then
         warn "配置里这些网卡在本机不存在，已留空交给网关自动识别：$stale"
-        warn "本机网卡：$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $2"("$4")"}' | tr '\n' ' ')"
+        warn "本机网卡：$(ip -o -4 addr show scope global 2>/dev/null |
+                       awk '$2 !~ /^(docker[0-9]*|veth[^\ ]*|br-[0-9a-f]{12}|virbr[0-9]*|lo)$/ {print $2"("$4")"}' |
+                       tr '\n' ' ')"
         warn "想手动指定：重装时带 IPTV_NIC=<网卡名>（如 IPTV_NIC=eth1），或在 Web 界面「参数配置」里改。"
     fi
     # 播放列表：只补缺失文件，不覆盖已有（用户的列表编辑都保存在这里）
@@ -399,13 +435,22 @@ print_status() {
     say "服务      : $(svc_active) / 开机自启 $(svc_enabled)（init: ${INIT:-未探测}）"
     if curl -sf -m 3 "$HEALTH_URL" >/dev/null 2>&1; then
         say "健康检查  : $HEALTH_URL ✓"
+        # status.json 是缩进多行输出，数组要先把换行压掉再匹配，否则永远抓不到
+        say "出口网卡  : $(curl -sf -m 5 "http://127.0.0.1:${PORT}/status.json" 2>/dev/null |
+                          tr '\n' ' ' |
+                          sed -n 's/.*"upstream_interfaces": *\(\[[^]]*\]\).*/\1/p' |
+                          tr -d '"[]' |
+                          sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g')"
         # 管理界面直接用 IP:端口 进（根路径与配置的前缀都能用，前缀只是别名）
         local pre alias_line=""
         pre=$(curl -sf -m 5 "http://127.0.0.1:${PORT}/status.json" 2>/dev/null |
               sed -n 's/.*"app_path_prefix":"\([^"]*\)".*/\1/p')
         [[ -n "$pre" ]] && alias_line="（等价入口 http://<IP>:${PORT}${pre}/）"
+        # 只列真实对外的地址：docker/veth/网桥内部地址列出来只会误导
         local lan
-        for lan in $(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -3); do
+        for lan in $(ip -4 -o addr show scope global 2>/dev/null |
+                     awk '$2 !~ /^(docker[0-9]*|veth[^\ ]*|br-[0-9a-f]{12}|virbr[0-9]*|lo)$/ {print $4}' |
+                     cut -d/ -f1 | head -3); do
             say "管理界面  : http://${lan}:${PORT}/"
             say "订阅地址  : http://${lan}:${PORT}/playlist.m3u"
         done
@@ -413,8 +458,6 @@ print_status() {
         local pl
         pl=$(curl -sf -m 8 "http://127.0.0.1:${PORT}/playlist.m3u" 2>/dev/null | grep -c '#EXTINF')
         [[ -n "${pl:-}" && "$pl" != "0" ]] && say "频道数    : $pl"
-        say "出口网卡  : $(curl -sf -m 5 "http://127.0.0.1:${PORT}/status.json" 2>/dev/null |
-                          sed -n 's/.*"upstream_interfaces":\(\[[^]]*\]\).*/\1/p' | tr -d '[]"')"
     else
         say "健康检查  : 未通过（服务未监听 $PORT）"
         say "看日志    : $(log_hint)"
@@ -423,10 +466,12 @@ print_status() {
 }
 
 resolve_package() {
-    # 本地目录没有二进制（管道执行 / 只传了脚本）→ 在线下载
+    # 本地目录没有二进制（管道执行 / 只传了脚本）→ 再试同目录的归档包 → 最后在线下载
     BIN_SRC="$(find_local_bin || true)"
+    if [[ -z "$BIN_SRC" ]] && prepare_local_archive; then
+        BIN_SRC="$(find_local_bin || true)"
+    fi
     [[ -n "$BIN_SRC" ]] || fetch_online
-    BIN_SRC="${BIN_SRC:-$(find_local_bin || true)}"
     [[ -n "$BIN_SRC" && -f "$BIN_SRC" ]] || die "缺少 iptv-gateway-linux-* 二进制（安装包不完整）"
 }
 
