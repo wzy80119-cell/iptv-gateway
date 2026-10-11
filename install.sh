@@ -5,7 +5,8 @@
 #  自动适配两类系统：
 #    - systemd Linux（飞牛 fnOS / Debian / Ubuntu / 通用 x86 服务器）
 #    - OpenWrt / iStoreOS（procd，无 systemd）
-#  按 uname -m 选资产：x86_64 -> linux-native.zip，armv7 -> linux-armv7.tar.gz
+#  按 uname -m 选资产：x86_64 -> linux-native.zip，arm64 -> linux-arm64.tar.gz，
+#                    armv7（含 32 位用户态的 armv8）-> linux-armv7.tar.gz
 #
 #  两种安装方式：
 #    A. 离线包安装（本脚本与 iptv-gateway-linux-* 在同一目录）：
@@ -18,6 +19,9 @@
 #         GH_PROXY=<url>           GitHub 下载加速前缀，默认 https://gh-proxy.com/
 #                                  （设为空串 GH_PROXY= 则走 GitHub 直连）
 #         GH_TOKEN=<token>         私有仓库访问令牌
+#       安装期环境变量（两种安装方式都可用的前缀赋值写法）：
+#         IPTV_NIC=eth1            指定 IPTV 内网网卡。不给也行：配置里本机不存在
+#                                  的网卡名会被清空，网关启动时按上游地址实测自动识别。
 #
 #  子命令：
 #    install（默认） / upgrade / status / uninstall [--purge]
@@ -85,12 +89,16 @@ detect_env() {
         x86_64|amd64)
             ARCH_TAG=amd64; PKG_FMT=zip
             ASSET_NAME="iptv-gateway-linux-native.zip" ;;
-        armv7l|armv7hl|armhf)
+        aarch64|arm64)
+            ARCH_TAG=arm64; PKG_FMT=tar.gz
+            ASSET_NAME="iptv-gateway-linux-arm64.tar.gz" ;;
+        armv7l|armv7hl|armhf|armv8*)
+            # armv8l：ARMv8 机器跑 32 位用户态（不少家用 ARM 路由器），走 armv7 包
             ARCH_TAG=armv7; PKG_FMT=tar.gz
             ASSET_NAME="iptv-gateway-linux-armv7.tar.gz" ;;
         armv6l)
-            die "ARMv6 未提供对应二进制（armv7 包需要 vfpv3 指令集），请用 x86_64 或 armv7 机型" ;;
-        *)  die "不支持的架构 $m（当前提供 linux/amd64 与 linux/armv7）" ;;
+            die "ARMv6 未提供对应二进制（armv7 包需要 vfpv3 指令集），请用 x86_64 / arm64 / armv7 机型" ;;
+        *)  die "不支持的架构 $m（当前提供 linux/amd64、linux/arm64 与 linux/armv7）" ;;
     esac
 
     if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
@@ -163,6 +171,8 @@ fetch_online() {
     dir="$(find "$ONLINE_TMP/unpack" -maxdepth 1 -type d -name 'iptv-gateway-*' | head -1)"
     [[ -n "$dir" ]] || die "压缩包结构异常（未找到 iptv-gateway-* 顶层目录）"
     SRC="$dir"
+    CONF_SRC="$SRC/config/iptv-gateway.conf"
+    M3U_SRC="$SRC/config/m3u"
     info "已获取发布包：$(basename "$dir")"
 }
 
@@ -234,7 +244,8 @@ svc_enable_start() {
                  systemctl enable iptv-gateway >/dev/null 2>&1
                  systemctl restart iptv-gateway ;;
         procd)   "$INITD" enable >/dev/null 2>&1 || true
-                 "$INITD" restart ;;
+                 # 首次安装时服务还没跑过，restart 会吐 "service delete (Not found)"，退化成 start
+                 "$INITD" restart 2>/dev/null || "$INITD" start ;;
     esac
 }
 
@@ -256,7 +267,16 @@ svc_disable_now() {
 svc_active() {
     case "$INIT" in
         systemd) systemctl is-active iptv-gateway 2>&1 ;;
-        procd)   pgrep -x iptv-gateway >/dev/null 2>&1 && echo running || echo stopped ;;
+        procd)
+            # procd 用 ubus 问服务状态最准；busybox 的 pgrep -x 匹配的是整条命令行，靠不住
+            if command -v ubus >/dev/null 2>&1 &&
+               ubus call service list '{"name":"iptv-gateway"}' 2>/dev/null | grep -q '"running":[[:space:]]*true'; then
+                echo running
+            elif pgrep -f "$BIN_DST" >/dev/null 2>&1; then
+                echo running
+            else
+                echo stopped
+            fi ;;
     esac
 }
 
@@ -296,9 +316,34 @@ place_bin() {
 # 把默认配置落到 /etc（已存在则不动），data-dir 改写为原生路径
 install_conf() {
     mkdir -p "$ETC/m3u" "$DATA"
-    if [[ -f "$CONF_SRC" && ! -f "$ETC/iptv-gateway.conf" ]]; then
+    if [[ ! -f "$ETC/iptv-gateway.conf" ]]; then
+        [[ -f "$CONF_SRC" ]] || die "安装包里缺少默认配置 $CONF_SRC（安装包不完整）"
         sed -e "s|^data-dir *=.*|data-dir = $DATA|" "$CONF_SRC" > "$ETC/iptv-gateway.conf"
         info "已生成 $ETC/iptv-gateway.conf"
+    fi
+    # IPTV_NIC=ethX：装完就把 IPTV 内网网卡改成指定值（路由器网卡名各不相同）
+    if [[ -n "${IPTV_NIC:-}" ]]; then
+        ip link show "$IPTV_NIC" >/dev/null 2>&1 || die "指定网卡 $IPTV_NIC 不存在（ip link 查看）"
+        sed -i -E "s|^([[:space:]]*upstream-interface[[:space:]]*)=.*|\1= $IPTV_NIC|" "$ETC/iptv-gateway.conf"
+        info "IPTV 内网网卡已设为 $IPTV_NIC"
+    fi
+    # IPTV 网卡：配置是从别的设备带来的（NAS 的 enp9s0 在路由器上根本不存在），
+    # 所以逐个检查四类网卡键，本机没有的名字一律留空——网关启动时会按播放列表
+    # 里的上游地址实测自动识别出口网卡，界面里也可以手动指定。
+    local stale="" key v
+    for key in upstream-interface upstream-interface-multicast upstream-interface-rtsp upstream-interface-http; do
+        v=$(sed -n -E "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*([[:print:]]+)$/\1/p" \
+              "$ETC/iptv-gateway.conf" | head -1 | tr -d '"')
+        [[ -n "$v" ]] || continue
+        if ! ip link show "$v" >/dev/null 2>&1; then
+            sed -i -E "s|^([[:space:]]*$key[[:space:]]*)=.*|\1= |" "$ETC/iptv-gateway.conf"
+            stale="$stale $key=$v"
+        fi
+    done
+    if [[ -n "$stale" ]]; then
+        warn "配置里这些网卡在本机不存在，已留空交给网关自动识别：$stale"
+        warn "本机网卡：$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $2"("$4")"}' | tr '\n' ' ')"
+        warn "想手动指定：重装时带 IPTV_NIC=<网卡名>（如 IPTV_NIC=eth1），或在 Web 界面「参数配置」里改。"
     fi
     # 播放列表：只补缺失文件，不覆盖已有（用户的列表编辑都保存在这里）
     if [[ -d "$M3U_SRC" ]]; then
@@ -354,16 +399,22 @@ print_status() {
     say "服务      : $(svc_active) / 开机自启 $(svc_enabled)（init: ${INIT:-未探测}）"
     if curl -sf -m 3 "$HEALTH_URL" >/dev/null 2>&1; then
         say "健康检查  : $HEALTH_URL ✓"
+        # 管理界面直接用 IP:端口 进（根路径与配置的前缀都能用，前缀只是别名）
+        local pre alias_line=""
+        pre=$(curl -sf -m 5 "http://127.0.0.1:${PORT}/status.json" 2>/dev/null |
+              sed -n 's/.*"app_path_prefix":"\([^"]*\)".*/\1/p')
+        [[ -n "$pre" ]] && alias_line="（等价入口 http://<IP>:${PORT}${pre}/）"
         local lan
         for lan in $(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -3); do
-            say "管理界面  : http://${lan}:${PORT}${PREFIX}/"
-            say "订阅地址  : http://${lan}:${PORT}${PREFIX}/playlist.m3u"
+            say "管理界面  : http://${lan}:${PORT}/"
+            say "订阅地址  : http://${lan}:${PORT}/playlist.m3u"
         done
-        local pl ch
-        pl=$(curl -sf -m 8 "http://127.0.0.1:${PORT}${PREFIX}/playlist.m3u" 2>/dev/null | grep -c '#EXTINF')
+        [[ -n "$alias_line" ]] && say "路径别名  : $alias_line"
+        local pl
+        pl=$(curl -sf -m 8 "http://127.0.0.1:${PORT}/playlist.m3u" 2>/dev/null | grep -c '#EXTINF')
         [[ -n "${pl:-}" && "$pl" != "0" ]] && say "频道数    : $pl"
-        ch=$(free -m 2>/dev/null | awk '/^Mem/ {print $7}')
-        [[ -n "${ch:-}" ]] && say "可用内存  : ${ch} MB"
+        say "出口网卡  : $(curl -sf -m 5 "http://127.0.0.1:${PORT}/status.json" 2>/dev/null |
+                          sed -n 's/.*"upstream_interfaces":\(\[[^]]*\]\).*/\1/p' | tr -d '[]"')"
     else
         say "健康检查  : 未通过（服务未监听 $PORT）"
         say "看日志    : $(log_hint)"
