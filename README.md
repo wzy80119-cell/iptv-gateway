@@ -19,11 +19,14 @@ SSH 进入 NAS / 服务器，执行：
 curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/wzy80119-cell/iptv-gateway/main/install.sh | sudo bash
 ```
 
-国内网络直连 GitHub 不稳定时，上面的 `gh-proxy.com` 前缀已内置加速；
-无需加速可直接用原始地址：
+前缀 `https://gh-proxy.com/` 是给 `raw.githubusercontent.com` 加速的（国内直连普遍被 DNS
+污染，实测本机直连超时）。Release 资产的下载加速已内置在脚本里，默认顺序
+`gh-proxy.com → ghfast.top → GitHub 直连`，失败自动换源，无需额外配置。
+
+能直连 GitHub 的主机可以去掉前缀，并用 `GH_PROXY=` 关闭资产加速：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wzy80119-cell/iptv-gateway/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/wzy80119-cell/iptv-gateway/main/install.sh | sudo bash -s -- upgrade
 ```
 
 安装脚本会自动：
@@ -48,7 +51,7 @@ curl -fsSL .../install.sh | sudo bash -s -- uninstall          # 保留配置与
 curl -fsSL .../install.sh | sudo bash -s -- uninstall --purge  # 全部删除
 
 # 环境变量
-GH_PROXY=https://ghfast.top/   # 换其它 GitHub 加速前缀
+GH_PROXY=https://ghfast.top/   # 换其它 GitHub 加速前缀（默认 gh-proxy.com，设为空则直连）
 GH_REPO=owner/repo             # 换发布仓库
 GH_TOKEN=xxx                   # 私有仓库访问令牌
 ```
